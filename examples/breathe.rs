@@ -8,9 +8,8 @@
 //
 // Portions of this implementation are based on work by Nat Pryce:
 // https://github.com/npryce/rusty-pi/blob/master/src/pi/gpio.rs
-
-extern crate sysfs_pwm;
-use sysfs_pwm::{Pwm, Result};
+extern crate dumb_sysfs_pwm;
+use dumb_sysfs_pwm::{Pwm, Result};
 
 // PIN: EHRPWM0A (P9_22)
 const BB_PWM_CHIP: u32 = 0;

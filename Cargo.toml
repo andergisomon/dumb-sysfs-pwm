@@ -1,5 +1,5 @@
 [package]
-name = "sysfs-pwm"
+name = "dumb-sysfs-pwm"
 version = "0.1.0"
 authors = [
     "Rust Embedded WG Linux Team <embedded-linux@teams.rust-embedded.org>",
