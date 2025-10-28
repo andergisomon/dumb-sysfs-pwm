@@ -10,6 +10,7 @@ repository = "https://github.com/rust-embedded/rust-sysfs-pwm"
 homepage = "https://github.com/rust-embedded/rust-sysfs-pwm"
 documentation = "https://docs.rs/sysfs-pwm"
 description = """
+Fork of rust-embedded/rust-sysfs-pwm. Will not be maintained.
 Provides access to the Linux sysfs interfaces to PWMs.
 Via this crate you can export, unexport, and control PWM pins for
 which there is an appropriate driver loaded in the kernel.
