@@ -43,6 +43,7 @@ pub struct PwmConfig {
 }
 
 impl PwmConfig {
+    ///make sure period_ns is greater than duty_cycle in ns set later! Avoid initializing the period_ns here to 0
     pub fn new(chip: u32, channel: u32, period_ns: u32) -> Self {
         Self {
             chip,
@@ -69,9 +70,12 @@ pub struct Pwm {
     period_ns: u32,
     enable_file: File,
     duty_cycle_file: File,
+    period_file: File,
+    polarity_file: File,
     // Buffer for writing values - avoids allocation in hot path
     write_buf: [u8; 16],
-    enable: bool
+    enable: bool,
+    polarity: Polarity,
 }
 
 impl Pwm {
@@ -94,6 +98,7 @@ impl Pwm {
         Self::write_sysfs_file(&format!("{}/period", base_path), config.period_ns)?;
 
         // Set polarity (must be done while disabled)
+        let polarity = config.polarity;
         let polarity_str = match config.polarity {
             Polarity::Normal => "normal",
             Polarity::Inverse => "inversed",
@@ -112,14 +117,25 @@ impl Pwm {
             .write(true)
             .open(format!("{}/duty_cycle", base_path))?;
 
+        let period_file = OpenOptions::new()
+            .write(true)
+            .open(format!("{}/period", base_path))?;
+
+        let polarity_file = OpenOptions::new()
+            .write(true)
+            .open(format!("{}/polarity", base_path))?;
+
         let mut pwm = Self {
             chip,
             channel,
             period_ns: config.period_ns,
             enable_file,
             duty_cycle_file,
+            period_file,
+            polarity_file,
             write_buf: [0u8; 16],
-            enable: false
+            enable: false,
+            polarity
         };
 
         // Ensure disabled state
@@ -199,23 +215,16 @@ impl Pwm {
     }
 
     /// Set the duty cycle in nanoseconds.
-    ///
-    /// This is the hot path - optimized for minimal overhead.
     #[inline]
     pub fn set_duty_cycle_ns(&mut self, duty_cycle_ns: u32) -> Result<()> {
-        // Format the number into our pre-allocated buffer
         let len = self.format_u32(duty_cycle_ns);
-
-        // Seek to beginning and write
         self.duty_cycle_file.seek(SeekFrom::Start(0))?;
         self.duty_cycle_file.write_all(&self.write_buf[..len])?;
         self.duty_cycle_file.flush()?;
-
         Ok(())
     }
 
     /// Set the duty cycle as a ratio (0.0 to 1.0). Panics if the duty cycle is not from 0.0 to 1.0.
-    ///
     /// Uses the cached period value to avoid file I/O.
     #[inline]
     pub fn set_duty_cycle(&mut self, duty_cycle: f32) -> Result<()> {
@@ -235,8 +244,41 @@ impl Pwm {
     }
 
     #[inline]
-    pub fn set_period_ns(&mut self, period: u32) {
-        self.period_ns = period;
+    pub fn set_period_ns(&mut self, period_ns: u32) -> Result<()> {
+        let len = self.format_u32(period_ns);
+        self.period_file.seek(SeekFrom::Start(0))?;
+        self.period_file.write_all(&self.write_buf[..len])?;
+        self.period_file.flush()?;
+        Ok(())
+    }
+
+    #[inline]
+    pub fn set_polarity(&mut self, polarity: Polarity) -> Result<()> {
+        self.polarity = polarity;
+
+        let len = match polarity {
+            Polarity::Inverse => {
+                let pol = b"inversed";
+                self.fill_write_buf_str(pol);
+                pol.len()
+            },
+            Polarity::Normal => {
+                let pol = b"normal";
+                self.fill_write_buf_str(pol);
+                pol.len()
+            }
+        };
+
+        self.polarity_file.seek(SeekFrom::Start(0))?;
+        self.polarity_file.write_all(&self.write_buf[..len])?;
+        self.polarity_file.flush()?;
+        Ok(())
+    }
+
+    /// Get the cached polarity
+    #[inline]
+    pub fn get_polarity(&self) -> Polarity {
+        self.polarity
     }
 
     /// Get the chip number.
@@ -273,6 +315,19 @@ impl Pwm {
         // Reverse into write_buf
         for i in 0..pos {
             self.write_buf[i] = temp[pos - 1 - i];
+        }
+
+        pos
+    }
+
+    ///For convenience: writes &str into the preallocated write buffer
+    #[inline]
+    fn fill_write_buf_str(&mut self, value: &[u8]) -> usize {
+
+        let pos = value.len();
+        // Reverse into write_buf
+        for i in 0..pos {
+            self.write_buf[i] = value[i];
         }
 
         pos
@@ -333,6 +388,7 @@ pub struct PwmBuilder {
 }
 
 impl PwmBuilder {
+    ///make sure period_ns will be greater than duty cycle in ns set later
     pub fn new(chip: u32, channel: u32, period_ns: u32) -> Self {
         Self {
             config: PwmConfig::new(chip, channel, period_ns),
@@ -369,10 +425,30 @@ impl PwmBuilder {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn test_fill_write_buf_str() {
+        let mut buf = [0u8; 16];
+
+        let format = |buf: &mut [u8; 16], value: &[u8]| -> usize {
+            let pos = value.len();
+            // Reverse into write_buf
+            for i in 0..pos {
+                buf[i] = value[i];
+            }
+            pos
+        };
+
+        let len = format(&mut buf, b"normal");
+        assert_eq!(&buf[..len], b"normal");
+
+        let len = format(&mut buf, b"inversed");
+        assert_eq!(&buf[..len], b"inversed");
+
+    }
+
+    #[test]
     fn test_format_u32() {
         let mut buf = [0u8; 16];
 
-        // Test the formatting logic directly
         let format = |buf: &mut [u8; 16], mut value: u32| -> usize {
             if value == 0 {
                 buf[0] = b'0';
