@@ -228,6 +228,12 @@ impl Pwm {
         self.period_ns
     }
 
+    #[inline]
+    pub fn set_period_ns(&mut self, period: u32) -> Result<()> {
+        self.period_ns = period;
+        Ok(())
+    }
+
     /// Get the chip number.
     #[inline]
     pub fn chip(&self) -> u32 {
@@ -310,13 +316,6 @@ impl Pwm {
         self.enable_file.as_raw_fd()
     }
 }
-
-    /// The period of the PWM signal in Nanoseconds
-    pub fn set_period_ns(&self, period_ns: u32) -> Result<()> {
-        let mut period_file = pwm_file_wo(&self.chip, self.number, "period")?;
-        period_file.write_all(format!("{}", period_ns).as_bytes())?;
-        Ok(())
-    }
 
 // Safety: File handles are safe to send between threads
 unsafe impl Send for Pwm {}
