@@ -3,6 +3,11 @@
 // Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
 // http://www.apache.org/license/LICENSE-2.0> or the MIT license
 // <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// Copyright 2016, Paul Osborne <osbpau@gmail.com>
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/license/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
 // option.  This file may not be copied, modified, or distributed
 // except according to those terms.
 //
@@ -11,231 +16,300 @@
 
 //! PWM access under Linux using the PWM sysfs interface
 
-use std::fs;
-use std::fs::File;
-use std::fs::OpenOptions;
-use std::io::prelude::*;
-use std::str::FromStr;
+use std::fs::{self, File, OpenOptions};
+use std::io::{prelude::*, SeekFrom};
+use std::os::unix::io::AsRawFd;
+use std::thread;
+use std::time::Duration;
 
 mod error;
 pub use error::Error;
 
-#[derive(Debug)]
-pub struct PwmChip {
-    pub number: u32,
-}
+pub type Result<T> = std::result::Result<T, error::Error>;
 
-#[derive(Debug)]
-pub struct Pwm {
-    chip: PwmChip,
-    number: u32,
-}
-
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Polarity {
     Normal,
     Inverse,
 }
 
-pub type Result<T> = ::std::result::Result<T, error::Error>;
-
-/// Open the specified entry name as a writable file
-fn pwm_file_wo(chip: &PwmChip, pin: u32, name: &str) -> Result<File> {
-    let f = OpenOptions::new().write(true).open(format!(
-        "/sys/class/pwm/pwmchip{}/pwm{}/{}",
-        chip.number, pin, name
-    ))?;
-    Ok(f)
+/// Configuration for PWM initialization
+#[derive(Debug, Clone)]
+pub struct PwmConfig {
+    pub chip: u32,
+    pub channel: u32,
+    pub period_ns: u32,
+    pub polarity: Polarity,
 }
 
-/// Open the specified entry name as a readable file
-fn pwm_file_ro(chip: &PwmChip, pin: u32, name: &str) -> Result<File> {
-    let f = File::open(format!(
-        "/sys/class/pwm/pwmchip{}/pwm{}/{}",
-        chip.number, pin, name
-    ))?;
-    Ok(f)
-}
-
-/// Get the u32 value from the given entry
-fn pwm_file_parse<T: FromStr>(chip: &PwmChip, pin: u32, name: &str) -> Result<T> {
-    let mut s = String::with_capacity(10);
-    let mut f = pwm_file_ro(chip, pin, name)?;
-    f.read_to_string(&mut s)?;
-    match s.trim().parse::<T>() {
-        Ok(r) => Ok(r),
-        Err(_) => Err(Error::Unexpected(format!(
-            "Unexpeted value file contents: {:?}",
-            s
-        ))),
-    }
-}
-
-/// Get the two u32 from capture file descriptor
-fn pwm_capture_parse<T: FromStr>(chip: &PwmChip, pin: u32, name: &str) -> Result<Vec<T>> {
-    let mut s = String::with_capacity(10);
-    let mut f = pwm_file_ro(chip, pin, name)?;
-    f.read_to_string(&mut s)?;
-    s = s.trim().to_string();
-    let capture = s.split_whitespace().collect::<Vec<_>>();
-    let mut vec: Vec<T> = vec![];
-    for s in capture.iter() {
-        if let Ok(j) = s.parse::<T>() {
-            vec.push(j);
-        }
-    }
-    Ok(vec)
-}
-
-impl PwmChip {
-    pub fn new(number: u32) -> Result<PwmChip> {
-        fs::metadata(format!("/sys/class/pwm/pwmchip{}", number))?;
-        Ok(PwmChip { number })
-    }
-
-    pub fn count(&self) -> Result<u32> {
-        let npwm_path = format!("/sys/class/pwm/pwmchip{}/npwm", self.number);
-        let mut npwm_file = File::open(&npwm_path)?;
-        let mut s = String::new();
-        npwm_file.read_to_string(&mut s)?;
-        match s.parse::<u32>() {
-            Ok(n) => Ok(n),
-            Err(_) => Err(Error::Unexpected(format!(
-                "Unexpected npwm contents: {:?}",
-                s
-            ))),
+impl PwmConfig {
+    pub fn new(chip: u32, channel: u32, period_ns: u32) -> Self {
+        Self {
+            chip,
+            channel,
+            period_ns,
+            polarity: Polarity::Normal,
         }
     }
 
-    pub fn export(&self, number: u32) -> Result<()> {
-        // only export if not already exported
-        if fs::metadata(format!(
-            "/sys/class/pwm/pwmchip{}/pwm{}",
-            self.number, number
-        ))
-        .is_err()
-        {
-            let path = format!("/sys/class/pwm/pwmchip{}/export", self.number);
-            let mut export_file = File::create(&path)?;
-            let _ = export_file.write_all(format!("{}", number).as_bytes());
-        }
-        Ok(())
+    pub fn with_polarity(mut self, polarity: Polarity) -> Self {
+        self.polarity = polarity;
+        self
     }
+}
 
-    pub fn unexport(&self, number: u32) -> Result<()> {
-        if fs::metadata(format!(
-            "/sys/class/pwm/pwmchip{}/pwm{}",
-            self.number, number
-        ))
-        .is_ok()
-        {
-            let path = format!("/sys/class/pwm/pwmchip{}/unexport", self.number);
-            let mut export_file = File::create(&path)?;
-            let _ = export_file.write_all(format!("{}", number).as_bytes());
-        }
-        Ok(())
-    }
+/// PWM controller with persistent file handles for real-time use.
+///
+/// File handles are opened once during initialization and reused
+/// for all subsequent operations. Period is cached since it doesn't
+/// change after setup.
+pub struct Pwm {
+    chip: u32,
+    channel: u32,
+    period_ns: u32,
+    enable_file: File,
+    duty_cycle_file: File,
+    // Buffer for writing values - avoids allocation in hot path
+    write_buf: [u8; 16],
 }
 
 impl Pwm {
-    /// Create a new Pwm wiht the provided chip/number
+    /// Create and initialize a new PWM channel.
     ///
-    /// This function does not export the Pwm pin
-    pub fn new(chip: u32, number: u32) -> Result<Pwm> {
-        let chip: PwmChip = PwmChip::new(chip)?;
-        Ok(Pwm { chip, number })
+    /// This will:
+    /// 1. Export the PWM channel if not already exported
+    /// 2. Set the period and polarity
+    /// 3. Open persistent file handles for enable and duty_cycle
+    /// 4. Initialize duty cycle to 0 and disabled state
+    pub fn new(config: PwmConfig) -> Result<Self> {
+        let chip = config.chip;
+        let channel = config.channel;
+        let base_path = format!("/sys/class/pwm/pwmchip{}/pwm{}", chip, channel);
+
+        // Export if needed
+        Self::export_channel(chip, channel)?;
+
+        // Set period first (must be done before duty_cycle)
+        Self::write_sysfs_file(&format!("{}/period", base_path), config.period_ns)?;
+
+        // Set polarity (must be done while disabled)
+        let polarity_str = match config.polarity {
+            Polarity::Normal => "normal",
+            Polarity::Inverse => "inversed",
+        };
+        Self::write_sysfs_file_str(&format!("{}/polarity", base_path), polarity_str)?;
+
+        // Set initial duty cycle to 0
+        Self::write_sysfs_file(&format!("{}/duty_cycle", base_path), 0u32)?;
+
+        // Now open persistent handles
+        let enable_file = OpenOptions::new()
+            .write(true)
+            .open(format!("{}/enable", base_path))?;
+
+        let duty_cycle_file = OpenOptions::new()
+            .write(true)
+            .open(format!("{}/duty_cycle", base_path))?;
+
+        let mut pwm = Self {
+            chip,
+            channel,
+            period_ns: config.period_ns,
+            enable_file,
+            duty_cycle_file,
+            write_buf: [0u8; 16],
+        };
+
+        // Ensure disabled state
+        pwm.enable(false)?;
+
+        Ok(pwm)
+    }
+
+    /// Export the PWM channel via sysfs
+    fn export_channel(chip: u32, channel: u32) -> Result<()> {
+        let pwm_path = format!("/sys/class/pwm/pwmchip{}/pwm{}", chip, channel);
+
+        if fs::metadata(&pwm_path).is_ok() {
+            // Already exported
+            return Ok(());
+        }
+
+        let export_path = format!("/sys/class/pwm/pwmchip{}/export", chip);
+        let mut export_file = File::create(&export_path)?;
+        write!(export_file, "{}", channel)?;
+        export_file.flush()?;
+        export_file.sync_all()?;
+
+        // Wait for sysfs to create the directory
+        let mut retries = 50;
+        while fs::metadata(&pwm_path).is_err() && retries > 0 {
+            thread::sleep(Duration::from_millis(10));
+            retries -= 1;
+        }
+
+        if fs::metadata(&pwm_path).is_err() {
+            return Err(Error::Unexpected(format!(
+                "PWM channel {} failed to export after 500ms",
+                channel
+            )));
+        }
+
+        // Additional delay for sysfs files to be fully ready
+        thread::sleep(Duration::from_millis(10));
+
+        Ok(())
+    }
+
+    /// Helper for one-shot sysfs writes during initialization
+    fn write_sysfs_file<T: std::fmt::Display>(path: &str, value: T) -> Result<()> {
+        let mut file = OpenOptions::new().write(true).open(path)?;
+        write!(file, "{}", value)?;
+        file.flush()?;
+        file.sync_all()?;
+        Ok(())
+    }
+
+    /// Helper for one-shot sysfs string writes during initialization
+    fn write_sysfs_file_str(path: &str, value: &str) -> Result<()> {
+        let mut file = OpenOptions::new().write(true).open(path)?;
+        file.write_all(value.as_bytes())?;
+        file.flush()?;
+        file.sync_all()?;
+        Ok(())
     }
 
     /// Run a closure with the GPIO exported
     #[inline]
-    pub fn with_exported<F>(&self, closure: F) -> Result<()>
-    where
-        F: FnOnce() -> Result<()>,
-    {
-        self.export()?;
-        match closure() {
-            Ok(()) => self.unexport(),
-            Err(e) => match self.unexport() {
-                Ok(()) => Err(e),
-                Err(ue) => Err(error::Error::Unexpected(format!(
-                    "Failed unexporting due to:\n{}\nwhile handling:\n{}",
-                    ue, e
-                ))),
-            },
-        }
-    }
+    pub fn enable(&mut self, enable: bool) -> Result<()> {
+        let byte = if enable { b'1' } else { b'0' };
 
-    /// Export the Pwm for use
-    pub fn export(&self) -> Result<()> {
-        self.chip.export(self.number)
-    }
+        // Seek to beginning and write
+        self.enable_file.seek(SeekFrom::Start(0))?;
+        self.enable_file.write_all(&[byte])?;
+        self.enable_file.flush()?;
 
-    /// Unexport the PWM
-    pub fn unexport(&self) -> Result<()> {
-        self.chip.unexport(self.number)
-    }
-
-    /// Enable/Disable the PWM Signal
-    pub fn enable(&self, enable: bool) -> Result<()> {
-        let mut enable_file = pwm_file_wo(&self.chip, self.number, "enable")?;
-        let contents = if enable { "1" } else { "0" };
-        enable_file.write_all(contents.as_bytes())?;
         Ok(())
     }
 
-    /// Query the state of enable for a given PWM pin
-    pub fn get_enabled(&self) -> Result<bool> {
-        pwm_file_parse::<u32>(&self.chip, self.number, "enable").map(|enable_state| {
-            match enable_state {
-                1 => true,
-                0 => false,
-                _ => panic!("enable != 1|0 should be unreachable"),
-            }
-        })
-    }
-
-    /// Get the currently configured duty_cycle in nanoseconds
-    pub fn get_duty_cycle_ns(&self) -> Result<u32> {
-        pwm_file_parse::<u32>(&self.chip, self.number, "duty_cycle")
-    }
-
-    /// Get the capture
-    pub fn get_capture(&self) -> Result<(u32, u32)> {
-        let t = pwm_capture_parse::<u32>(&self.chip, self.number, "capture")?;
-        if t.len() == 2 {
-            Ok((t[0], t[1]))
-        } else {
-            Err(error::Error::Unexpected("Failed exporting".to_string()))
-        }
-    }
-
-    /// The active time of the PWM signal
+    /// Set the duty cycle in nanoseconds.
     ///
-    /// Value is in nanoseconds and must be less than the period.
-    pub fn set_duty_cycle_ns(&self, duty_cycle_ns: u32) -> Result<()> {
-        // we'll just let the kernel do the validation
-        let mut duty_cycle_file = pwm_file_wo(&self.chip, self.number, "duty_cycle")?;
-        duty_cycle_file.write_all(format!("{}", duty_cycle_ns).as_bytes())?;
+    /// This is the hot path - optimized for minimal overhead.
+    #[inline]
+    pub fn set_duty_cycle_ns(&mut self, duty_cycle_ns: u32) -> Result<()> {
+        // Format the number into our pre-allocated buffer
+        let len = self.format_u32(duty_cycle_ns);
+
+        // Seek to beginning and write
+        self.duty_cycle_file.seek(SeekFrom::Start(0))?;
+        self.duty_cycle_file.write_all(&self.write_buf[..len])?;
+        self.duty_cycle_file.flush()?;
+
         Ok(())
     }
 
-    /// Get the currently configured duty_cycle as percentage of period
-    pub fn get_duty_cycle(&self) -> Result<f32> {
-        Ok((self.get_duty_cycle_ns()? as f32) / (self.get_period_ns()? as f32))
-    }
-
-    /// The active time of the PWM signal
+    /// Set the duty cycle as a ratio (0.0 to 1.0).
     ///
-    /// Value is as percentage of period.
-    pub fn set_duty_cycle(&self, duty_cycle: f32) -> Result<()> {
-        self.set_duty_cycle_ns((self.get_period_ns()? as f32 * duty_cycle).round() as u32)?;
+    /// Uses the cached period value to avoid file I/O.
+    #[inline]
+    pub fn set_duty_cycle(&mut self, duty_cycle: f32) -> Result<()> {
+        assert!(
+            (0.0..=1.0).contains(&duty_cycle),
+            "Duty cycle must be between 0.0 and 1.0"
+        );
+
+        let duty_ns = (self.period_ns as f32 * duty_cycle).round() as u32;
+        self.set_duty_cycle_ns(duty_ns)
+    }
+
+    /// Get the cached period in nanoseconds.
+    #[inline]
+    pub fn period_ns(&self) -> u32 {
+        self.period_ns
+    }
+
+    /// Get the chip number.
+    #[inline]
+    pub fn chip(&self) -> u32 {
+        self.chip
+    }
+
+    /// Get the channel number.
+    #[inline]
+    pub fn channel(&self) -> u32 {
+        self.channel
+    }
+
+    /// Format a u32 into the write buffer, returning the length.
+    ///
+    /// This avoids allocation in the hot path by using a pre-allocated buffer.
+    #[inline]
+    fn format_u32(&mut self, mut value: u32) -> usize {
+        if value == 0 {
+            self.write_buf[0] = b'0';
+            return 1;
+        }
+
+        let mut pos = 0;
+        let mut temp = [0u8; 16];
+
+        while value > 0 {
+            temp[pos] = b'0' + (value % 10) as u8;
+            value /= 10;
+            pos += 1;
+        }
+
+        // Reverse into write_buf
+        for i in 0..pos {
+            self.write_buf[i] = temp[pos - 1 - i];
+        }
+
+        pos
+    }
+
+    /// Unexport the PWM channel.
+    ///
+    /// Called automatically on drop, but can be called manually if needed.
+    pub fn unexport(&mut self) -> Result<()> {
+        // Disable first
+        let _ = self.enable(false);
+        let _ = self.set_duty_cycle_ns(0);
+
+        let pwm_path = format!("/sys/class/pwm/pwmchip{}/pwm{}", self.chip, self.channel);
+
+        if fs::metadata(&pwm_path).is_ok() {
+            let unexport_path = format!("/sys/class/pwm/pwmchip{}/unexport", self.chip);
+            let mut unexport_file = File::create(&unexport_path)?;
+            write!(unexport_file, "{}", self.channel)?;
+            unexport_file.flush()?;
+            unexport_file.sync_all()?;
+        }
+
         Ok(())
     }
 
-    /// Get the currently configured period in nanoseconds
-    pub fn get_period_ns(&self) -> Result<u32> {
-        pwm_file_parse::<u32>(&self.chip, self.number, "period")
+    /// Sync all pending writes to hardware.
+    ///
+    /// Call this if you need to ensure writes have been committed
+    /// before proceeding (e.g., before reading back state).
+    pub fn sync(&mut self) -> Result<()> {
+        self.enable_file.sync_all()?;
+        self.duty_cycle_file.sync_all()?;
+        Ok(())
     }
+
+    /// Get the raw file descriptor for the duty cycle file.
+    ///
+    /// Useful for advanced use cases like epoll or custom I/O.
+    pub fn duty_cycle_fd(&self) -> i32 {
+        self.duty_cycle_file.as_raw_fd()
+    }
+
+    /// Get the raw file descriptor for the enable file.
+    pub fn enable_fd(&self) -> i32 {
+        self.enable_file.as_raw_fd()
+    }
+}
 
     /// The period of the PWM signal in Nanoseconds
     pub fn set_period_ns(&self, period_ns: u32) -> Result<()> {
@@ -244,28 +318,91 @@ impl Pwm {
         Ok(())
     }
 
-    /// Set the polarity of the PWM signal
-    pub fn set_polarity(&self, polarity: Polarity) -> Result<()> {
-        let mut polarity_file = pwm_file_wo(&self.chip, self.number, "polarity")?;
-        match polarity {
-            Polarity::Normal => polarity_file.write_all("normal".as_bytes())?,
-            Polarity::Inverse => polarity_file.write_all("inversed".as_bytes())?,
-        };
-        Ok(())
+// Safety: File handles are safe to send between threads
+unsafe impl Send for Pwm {}
+
+/// Builder for more complex PWM setups
+pub struct PwmBuilder {
+    config: PwmConfig,
+    initial_duty_cycle: Option<f32>,
+    start_enabled: bool,
+}
+
+impl PwmBuilder {
+    pub fn new(chip: u32, channel: u32, period_ns: u32) -> Self {
+        Self {
+            config: PwmConfig::new(chip, channel, period_ns),
+            initial_duty_cycle: None,
+            start_enabled: false,
+        }
     }
 
-    /// Get the polarity of the PWM signal
-    pub fn get_polarity(&self) -> Result<Polarity> {
-        let mut polarity_file = pwm_file_ro(&self.chip, self.number, "polarity")?;
-        let mut s = String::new();
-        polarity_file.read_to_string(&mut s)?;
-        match s.trim() {
-            "normal" => Ok(Polarity::Normal),
-            "inversed" => Ok(Polarity::Inverse),
-            _ => Err(Error::Unexpected(format!(
-                "Unexpected polarity file contents: {:?}",
-                s
-            ))),
+    pub fn polarity(mut self, polarity: Polarity) -> Self {
+        self.config.polarity = polarity;
+        self
+    }
+
+    pub fn initial_duty_cycle(mut self, duty_cycle: f32) -> Self {
+        self.initial_duty_cycle = Some(duty_cycle);
+        self
+    }
+
+    pub fn start_enabled(mut self, enabled: bool) -> Self {
+        self.start_enabled = enabled;
+        self
+    }
+
+    pub fn build(self) -> Result<Pwm> {
+        let mut pwm = Pwm::new(self.config)?;
+
+        if let Some(duty_cycle) = self.initial_duty_cycle {
+            pwm.set_duty_cycle(duty_cycle)?;
         }
+
+        if self.start_enabled {
+            pwm.enable(true)?;
+        }
+
+        Ok(pwm)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_u32() {
+        let config = PwmConfig::new(0, 0, 20000);
+        // Can't actually test without hardware, but we can test the formatter
+        let mut buf = [0u8; 16];
+
+        // Test the formatting logic directly
+        let format = |buf: &mut [u8; 16], mut value: u32| -> usize {
+            if value == 0 {
+                buf[0] = b'0';
+                return 1;
+            }
+            let mut pos = 0;
+            let mut temp = [0u8; 16];
+            while value > 0 {
+                temp[pos] = b'0' + (value % 10) as u8;
+                value /= 10;
+                pos += 1;
+            }
+            for i in 0..pos {
+                buf[i] = temp[pos - 1 - i];
+            }
+            pos
+        };
+
+        let len = format(&mut buf, 0);
+        assert_eq!(&buf[..len], b"0");
+
+        let len = format(&mut buf, 12345);
+        assert_eq!(&buf[..len], b"12345");
+
+        let len = format(&mut buf, 20000);
+        assert_eq!(&buf[..len], b"20000");
     }
 }
