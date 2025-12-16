@@ -71,6 +71,7 @@ pub struct Pwm {
     duty_cycle_file: File,
     // Buffer for writing values - avoids allocation in hot path
     write_buf: [u8; 16],
+    enable: bool
 }
 
 impl Pwm {
@@ -87,7 +88,7 @@ impl Pwm {
         let base_path = format!("/sys/class/pwm/pwmchip{}/pwm{}", chip, channel);
 
         // Export if needed
-        Self::export_channel(chip, channel)?;
+        Self::export(chip, channel)?;
 
         // Set period first (must be done before duty_cycle)
         Self::write_sysfs_file(&format!("{}/period", base_path), config.period_ns)?;
@@ -118,16 +119,17 @@ impl Pwm {
             enable_file,
             duty_cycle_file,
             write_buf: [0u8; 16],
+            enable: false
         };
 
         // Ensure disabled state
-        pwm.enable(false)?;
+        pwm.set_enable(false)?;
 
         Ok(pwm)
     }
 
     /// Export the PWM channel via sysfs
-    fn export_channel(chip: u32, channel: u32) -> Result<()> {
+    fn export(chip: u32, channel: u32) -> Result<()> {
         let pwm_path = format!("/sys/class/pwm/pwmchip{}/pwm{}", chip, channel);
 
         if fs::metadata(&pwm_path).is_ok() {
@@ -179,9 +181,8 @@ impl Pwm {
         Ok(())
     }
 
-    /// Run a closure with the GPIO exported
     #[inline]
-    pub fn enable(&mut self, enable: bool) -> Result<()> {
+    pub fn set_enable(&mut self, enable: bool) -> Result<()> {
         let byte = if enable { b'1' } else { b'0' };
 
         // Seek to beginning and write
@@ -190,6 +191,11 @@ impl Pwm {
         self.enable_file.flush()?;
 
         Ok(())
+    }
+
+    #[inline]
+    pub fn get_enable(&self) -> bool {
+        self.enable
     }
 
     /// Set the duty cycle in nanoseconds.
@@ -208,7 +214,7 @@ impl Pwm {
         Ok(())
     }
 
-    /// Set the duty cycle as a ratio (0.0 to 1.0).
+    /// Set the duty cycle as a ratio (0.0 to 1.0). Panics if the duty cycle is not from 0.0 to 1.0.
     ///
     /// Uses the cached period value to avoid file I/O.
     #[inline]
@@ -229,9 +235,8 @@ impl Pwm {
     }
 
     #[inline]
-    pub fn set_period_ns(&mut self, period: u32) -> Result<()> {
+    pub fn set_period_ns(&mut self, period: u32) {
         self.period_ns = period;
-        Ok(())
     }
 
     /// Get the chip number.
@@ -278,7 +283,7 @@ impl Pwm {
     /// Called automatically on drop, but can be called manually if needed.
     pub fn unexport(&mut self) -> Result<()> {
         // Disable first
-        let _ = self.enable(false);
+        let _ = self.set_enable(false);
         let _ = self.set_duty_cycle_ns(0);
 
         let pwm_path = format!("/sys/class/pwm/pwmchip{}/pwm{}", self.chip, self.channel);
@@ -324,7 +329,7 @@ unsafe impl Send for Pwm {}
 pub struct PwmBuilder {
     config: PwmConfig,
     initial_duty_cycle: Option<f32>,
-    start_enabled: bool,
+    enable: bool,
 }
 
 impl PwmBuilder {
@@ -332,7 +337,7 @@ impl PwmBuilder {
         Self {
             config: PwmConfig::new(chip, channel, period_ns),
             initial_duty_cycle: None,
-            start_enabled: false,
+            enable: false,
         }
     }
 
@@ -346,11 +351,6 @@ impl PwmBuilder {
         self
     }
 
-    pub fn start_enabled(mut self, enabled: bool) -> Self {
-        self.start_enabled = enabled;
-        self
-    }
-
     pub fn build(self) -> Result<Pwm> {
         let mut pwm = Pwm::new(self.config)?;
 
@@ -358,8 +358,8 @@ impl PwmBuilder {
             pwm.set_duty_cycle(duty_cycle)?;
         }
 
-        if self.start_enabled {
-            pwm.enable(true)?;
+        if self.enable {
+            pwm.set_enable(true)?;
         }
 
         Ok(pwm)
