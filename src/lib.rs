@@ -368,12 +368,8 @@ impl PwmBuilder {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn test_format_u32() {
-        let config = PwmConfig::new(0, 0, 20000);
-        // Can't actually test without hardware, but we can test the formatter
         let mut buf = [0u8; 16];
 
         // Test the formatting logic directly
