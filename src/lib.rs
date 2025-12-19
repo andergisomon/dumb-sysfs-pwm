@@ -91,8 +91,27 @@ impl Pwm {
         // Export if needed
         Self::export(chip, channel)?;
 
-        // Set period first (must be done before duty_cycle)
-        Self::write_sysfs_file(&format!("{}/period", base_path), config.period_ns)?;
+        // Self::write_sysfs_file_str(&format!("{}/polarity", base_path), polarity_str)?;
+
+        // Set initial duty cycle to 0
+        // Self::write_sysfs_file(&format!("{}/duty_cycle", base_path), 0u32)?;
+
+        // Now open persistent handles
+        let enable_file = OpenOptions::new()
+            .write(true)
+            .open(format!("{}/enable", base_path))?;
+
+        let mut duty_cycle_file = OpenOptions::new()
+            .write(true)
+            .open(format!("{}/duty_cycle", base_path))?;
+
+        let mut period_file = OpenOptions::new()
+            .write(true)
+            .open(format!("{}/period", base_path))?;
+
+        let mut polarity_file = OpenOptions::new()
+            .write(true)
+            .open(format!("{}/polarity", base_path))?;
 
         // Set polarity (must be done while disabled)
         let polarity = config.polarity;
@@ -100,27 +119,14 @@ impl Pwm {
             Polarity::Normal => "normal",
             Polarity::Inverse => "inversed",
         };
-        Self::write_sysfs_file_str(&format!("{}/polarity", base_path), polarity_str)?;
+
+        Self::write_sysfs_file_str(&mut polarity_file, polarity_str)?;
+
+        // Set period first (must be done before duty_cycle)
+        Self::write_sysfs_file(&mut period_file, config.period_ns)?;
 
         // Set initial duty cycle to 0
-        Self::write_sysfs_file(&format!("{}/duty_cycle", base_path), 0u32)?;
-
-        // Now open persistent handles
-        let enable_file = OpenOptions::new()
-            .write(true)
-            .open(format!("{}/enable", base_path))?;
-
-        let duty_cycle_file = OpenOptions::new()
-            .write(true)
-            .open(format!("{}/duty_cycle", base_path))?;
-
-        let period_file = OpenOptions::new()
-            .write(true)
-            .open(format!("{}/period", base_path))?;
-
-        let polarity_file = OpenOptions::new()
-            .write(true)
-            .open(format!("{}/polarity", base_path))?;
+        Self::write_sysfs_file(&mut duty_cycle_file, 0u32)?;
 
         let mut pwm = Self {
             chip,
@@ -177,8 +183,8 @@ impl Pwm {
     }
 
     /// Helper for one-shot sysfs writes during initialization
-    fn write_sysfs_file<T: std::fmt::Display>(path: &str, value: T) -> Result<()> {
-        let mut file = OpenOptions::new().write(true).open(path)?;
+    fn write_sysfs_file<T: std::fmt::Display>(file: &mut File, value: T) -> Result<()> {
+        // let mut file = OpenOptions::new().write(true).open(path)?;
         write!(file, "{}", value)?;
         file.flush()?;
         file.sync_all()?;
@@ -186,8 +192,8 @@ impl Pwm {
     }
 
     /// Helper for one-shot sysfs string writes during initialization
-    fn write_sysfs_file_str(path: &str, value: &str) -> Result<()> {
-        let mut file = OpenOptions::new().write(true).open(path)?;
+    fn write_sysfs_file_str(file: &mut File, value: &str) -> Result<()> {
+        // let mut file = OpenOptions::new().write(true).open(path)?;
         file.write_all(value.as_bytes())?;
         file.flush()?;
         file.sync_all()?;
